@@ -647,6 +647,7 @@ void step() {
         case IRET: {
             check_privilege();
             vm.pc = pop();
+            vm.rv = pop();
             vm.fp = pop();
             vm.base = pop();
             vm.limit = pop();
@@ -671,6 +672,7 @@ void step() {
             push(vm.limit);
             push(vm.base);
             push(vm.fp);
+            push(vm.rv);
             push(vm.pc);
             vm.base = 0;
             uint32_t vector_addr = int_id * 4;
