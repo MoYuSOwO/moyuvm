@@ -4,9 +4,7 @@
 #include <stdlib.h>
 #include <conio.h>
 
-#define STACK_SIZE 256
-#define RETURN_STACK_SIZE 256
-#define MEM_SIZE 65536
+#define MAX_MEM 65536
 
 #define VIT_SIZE 1024
 #define BOOTLOADER_ENTRY 3072
@@ -43,16 +41,16 @@ typedef union {
 typedef struct {
     uint32_t pc;
     uint32_t sp;
-    uint32_t stack[STACK_SIZE];
-    uint32_t rsp;
-    uint32_t rstack[RETURN_STACK_SIZE];
-    uint8_t memory[MEM_SIZE]; 
+    uint32_t fp;
+    uint32_t base;
+    uint32_t limit;
+    uint32_t rv;
+    uint8_t memory[MAX_MEM]; 
     bool running;
     bool halted;
     bool int_enable;
     bool int_pending;
     uint32_t int_vector;
-    uint32_t base_offset;
 } VM;
 
 typedef struct {
@@ -70,6 +68,18 @@ VM vm;
 IO io;
 FIO fio;
 
+void error(const char* msg) {
+    printf("Panic: %s\n", msg);
+    vm.running = false;
+    exit(1);
+}
+
+void check_privilege() {
+    if (vm.base != 0) {
+        error("Privileged Instruction Access Violation");
+    }
+}
+
 typedef enum {
     // 基础操作
     HLT = 0x00, 
@@ -85,7 +95,8 @@ typedef enum {
     DUP = 0x20, // 复制栈顶
     SWAP, // 交换两个栈顶元素
     DROP, // 丢弃栈顶元素
-    PICK, // 偷窥栈下面的第n个元素 (带操作数n)
+    PES, // 复制栈下面的第n个元素到栈顶 (带操作数n)
+    PEF, // 复制栈帧下面的第n个元素到栈顶 (带操作数n)
 
     // 整数运算
     ADDI = 0x30, SUBI, MULI, DIVI, MOD, ITF,
@@ -115,60 +126,40 @@ typedef enum {
     CLI = 0x90, // 进入原子区
     STI, // 退出原子区
     INT, // 软中断
-    SBS, // 设定基址
+
+    // 寄存器操作
+    SR = 0xA0,
+    GR,
+    STF, // 将当前sp设为fp
     
     // 调试用
     DBG = 0xFF  // 打印整个栈
 } OpCode;
 
+typedef enum {
+    REG_SP = 0,
+    REG_FP,
+    REG_BASE,
+    REG_LIMIT,
+    REG_RV
+} RegOp;
+
 uint32_t resolve_addr(uint32_t logic_addr) {
     if (logic_addr >= MMIO_BASE) {
         return logic_addr;
     }
-    uint32_t phys_addr = logic_addr + vm.base_offset;
-    if (phys_addr >= MEM_SIZE || phys_addr < logic_addr) {
-        error("Segmentation Fault");
+    if (logic_addr >= vm.limit) {
+        error("Segmentation Fault (Logic Address Limit Exceeded)");
+    }
+    uint32_t phys_addr = logic_addr + vm.base;
+    if (phys_addr >= MAX_MEM) { 
+        error("Physical Memory Overflow");
+    }
+    if (phys_addr < logic_addr) {
+        error("Segmentation Fault Overflow");
     }
     
     return phys_addr;
-}
-
-void error(const char* msg) {
-    printf("Panic: %s\n", msg);
-    vm.running = false;
-    exit(1);
-}
-
-void push(uint32_t val) {
-    if (vm.sp >= STACK_SIZE) error("Stack Overflow");
-    vm.stack[vm.sp++] = val;
-}
-
-uint32_t pop() {
-    if (vm.sp == 0) error("Stack Underflow");
-    return vm.stack[--vm.sp];
-}
-
-uint32_t top() {
-    if (vm.sp == 0) error("Stack Underflow");
-    if (vm.sp > STACK_SIZE) error("Stack Overflow");
-    return vm.stack[vm.sp - 1];
-}
-
-uint32_t peak_at(uint32_t soffset) {
-    uint32_t tsp = vm.sp - soffset - 1;
-    if (tsp >= STACK_SIZE) error("Stack Overflow");
-    return vm.stack[tsp];
-}
-
-void rpush(uint32_t val) {
-    if (vm.rsp >= RETURN_STACK_SIZE) error("Return Stack Overflow");
-    vm.rstack[vm.rsp++] = val;
-}
-
-uint32_t rpop() {
-    if (vm.rsp == 0) error("Return Stack Underflow");
-    return vm.rstack[--vm.rsp];
 }
 
 // 总线读取
@@ -219,11 +210,11 @@ void hardware_disk_exec(int cmd) {
 
     // 数据搬运
     if (cmd == 1) {
-        if (addr + 512 <= MEM_SIZE) {
+        if (addr + 512 <= MAX_MEM) {
             fread(&vm.memory[addr], 1, 512, disk);
         }
     } else if (cmd == 2) {
-        if (addr + 512 <= MEM_SIZE) {
+        if (addr + 512 <= MAX_MEM) {
             fwrite(&vm.memory[addr], 1, 512, disk);
         }
     }
@@ -257,6 +248,46 @@ void store_u32(uint32_t addr, uint32_t val) {
     bus_write(addr + 1, (uint8_t)((val >> 16) & 0xFF));
     bus_write(addr + 2, (uint8_t)((val >> 8)  & 0xFF));
     bus_write(addr + 3, (uint8_t)(val & 0xFF));
+}
+
+// 纯物理内存写入
+void phys_write_u32(uint32_t phys_addr, uint32_t val) {
+    if (phys_addr >= MAX_MEM - 3) error("Physical Memory Access Violation");
+    vm.memory[phys_addr] = (val >> 24) & 0xFF;
+    vm.memory[phys_addr + 1] = (val >> 16) & 0xFF;
+    vm.memory[phys_addr + 2] = (val >> 8)  & 0xFF;
+    vm.memory[phys_addr + 3] = val & 0xFF;
+}
+
+// 纯物理内存读取
+uint32_t phys_read_u32(uint32_t phys_addr) {
+    uint32_t val = 0;
+    val |= (uint32_t)vm.memory[phys_addr] << 24;
+    val |= (uint32_t)vm.memory[phys_addr + 1] << 16;
+    val |= (uint32_t)vm.memory[phys_addr + 2] << 8;
+    val |= (uint32_t)vm.memory[phys_addr + 3];
+    return val;
+}
+
+void push(uint32_t val) {
+    if (vm.sp - 4 < vm.base) error("Stack Overflow (Physical Limit)");
+    vm.sp -= 4;
+    phys_write_u32(vm.sp, val);
+}
+
+uint32_t pop() {
+    if (vm.sp >= vm.base + vm.limit || vm.sp >= MAX_MEM) error("Stack Underflow");
+    uint32_t val = phys_read_u32(vm.sp);
+    vm.sp += 4;
+    return val;
+}
+
+uint32_t peak_at(uint32_t offset) {
+    return load_u32(vm.sp + (offset * 4));
+}
+
+uint32_t top() {
+    return peak_at(0);
 }
 
 void step() {
@@ -317,10 +348,30 @@ void step() {
             break;
         }
 
-        case PICK: {
-            uint32_t soffset = fetch_u32();
-            uint32_t val = peak_at(soffset);
-            push(val);
+        case PES: {
+            BitCaster caster;
+            caster.u = fetch_u32();
+            uint32_t target_addr = vm.sp + caster.i;
+            if (vm.base != 0) {
+                if (target_addr < vm.base || target_addr >= vm.base + vm.limit)
+                    error("Segmentation Fault (Stack Access Violation)");
+            } else {
+                if (target_addr >= MAX_MEM)
+                    error("Physical Memory Overflow");
+            }
+            push(phys_read_u32(target_addr));
+            break;
+        }
+
+        case PEF: {
+            BitCaster caster;
+            caster.u = fetch_u32();
+            uint32_t target_addr = vm.fp + caster.i;
+            if (vm.base != 0) {
+                if (target_addr < vm.base || target_addr >= vm.base + vm.limit)
+                    error("Segmentation Fault (FP Access)");
+            }
+            push(phys_read_u32(target_addr));
             break;
         }
 
@@ -582,75 +633,126 @@ void step() {
 
         case CALL: {
             uint32_t addr = fetch_u32();
-            rpush(vm.pc);
+            push(vm.pc);
             vm.pc = addr;
             break;
         }
 
         case RET: {
-            uint32_t addr = rpop();
+            uint32_t addr = pop();
             vm.pc = addr;
             break;
         }
 
         case IRET: {
-            vm.pc = rpop();
-            vm.base_offset = rpop();
+            check_privilege();
+            vm.pc = pop();
+            vm.fp = pop();
+            vm.base = pop();
+            vm.limit = pop();
             vm.int_enable = true;
             break;
         }
 
         case CLI: {
+            check_privilege();
             vm.int_enable = false;
             break;
         }
 
         case STI: {
+            check_privilege();
             vm.int_enable = true;
             break;
         }
 
         case INT: {
             uint32_t int_id = fetch_u32();
-            rpush(vm.base_offset);
-            rpush(vm.pc);
-            vm.base_offset = 0;
+            push(vm.limit);
+            push(vm.base);
+            push(vm.fp);
+            push(vm.pc);
+            vm.base = 0;
             uint32_t vector_addr = int_id * 4;
             uint32_t handler_addr = load_u32(vector_addr); 
             vm.pc = handler_addr;
             break;
         }
 
-        case SBS: {
-            uint32_t new_base = pop();
-            vm.base_offset = new_base;
-            vm.pc = 0;
+        case GR: {
+            uint32_t reg_id = fetch_u32();
+            uint32_t val = 0;
+            switch (reg_id) {
+                case REG_SP: val = vm.sp - vm.base; break;
+                case REG_FP: val = vm.fp - vm.base; break;
+                case REG_BASE: val = vm.base; break; 
+                case REG_LIMIT: val = vm.limit; break;
+                case REG_RV: val = vm.rv; break;
+            }
+            push(val);
+            break;
+        }
+
+        case SR: {
+            uint32_t reg_id = fetch_u32();
+            uint32_t val = pop();
+            switch(reg_id) {
+                case REG_SP: {
+                    vm.sp = val + vm.base; 
+                    if (vm.sp > vm.base + vm.limit || vm.sp > MAX_MEM) {
+                        error("Stack Overflow / Segmentation Fault");
+                    }
+                    break;
+                }
+                    
+                case REG_FP: {
+                    vm.fp = val + vm.base; 
+                    if (vm.fp > vm.base + vm.limit || vm.fp > MAX_MEM) {
+                        error("Frame Pointer Segmentation Fault");
+                    }
+                    break;
+                }
+
+                case REG_BASE:
+                    check_privilege();
+                    vm.base = val;
+                    vm.pc = 0;
+                    break;
+
+                case REG_LIMIT:
+                    check_privilege();
+                    vm.limit = val;
+                    break;
+
+                case REG_RV:
+                    vm.rv = val;
+                    break;
+            }
+            break;
+        }
+
+        case STF: {
+            vm.fp = vm.sp; 
             break;
         }
 
         case DBG: {
             printf("\n====== [DEBUG: STACK DUMP] ======\n");
-            if (vm.sp == 0) {
-                printf("(Stack is Empty)\n");
+            uint32_t start_addr = (vm.base + vm.limit > MAX_MEM) ? MAX_MEM : vm.base + vm.limit;
+            if (vm.sp >= start_addr) {
+                 printf("(Stack is Empty)\n");
             } else {
-                // 倒序打印：从栈顶 (Top) 到 栈底 (Bottom)
-                // 这样符合视觉直觉：上面的是新进来的
-                for (int i = vm.sp - 1; i >= 0; i--) {
-                    uint32_t val = vm.stack[i];
-                    
-                    // 利用 BitCaster 强转类型，查看它的浮点身姿
-                    BitCaster bc;
-                    bc.u = val;
-
-                    printf("| [%03d] | HEX: 0x%08X | INT: %-11d | FLT: %-10.5f | CHAR: '%c' |\n", 
-                           i,              // 栈索引
-                           bc.u,           // 16进制 (看地址或位模式)
-                           bc.i,           // 有符号整数 (看计数器或偏移)
-                           bc.f,           // 浮点数 (看算术结果)
-                           (val >= 32 && val <= 126) ? (char)val : '.'); // 字符 (看字符串)
+                for (uint32_t addr = start_addr - 4; addr >= vm.sp && addr < MAX_MEM; addr -= 4) {
+                    if (addr > start_addr) break; 
+                    uint32_t val = phys_read_u32(addr);
+                    BitCaster bc; bc.u = val;
+                    printf(
+                        "| [0x%04X] | HEX: 0x%08X | INT: %-11d | FLT: %-10.5f |\n", 
+                        addr, bc.u, bc.i, bc.f
+                    );
                 }
             }
-            printf("====== [ SP: %d | PC: 0x%04X ] ======\n\n", vm.sp, vm.pc - 1);
+            printf("====== [ SP: 0x%04X | FP: 0x%04X | PC: 0x%04X | Base: 0x%04X | Limit: 0x%04X | RV: 0x%04X ] ======\n\n", vm.sp, vm.fp, vm.pc - 1, vm.base, vm.limit, vm.rv);
             break;
         }
 
@@ -667,9 +769,11 @@ void check_interrupts() {
         vm.halted = false;
         vm.int_enable = false;
         vm.int_pending = false;
-        rpush(vm.base_offset);
-        rpush(vm.pc);
-        vm.base_offset = 0;
+        push(vm.limit);
+        push(vm.base);
+        push(vm.fp);
+        push(vm.pc);
+        vm.base = 0;
         uint32_t vector_addr = vm.int_vector * 4;
         uint32_t handler_addr = load_u32(vector_addr); 
         vm.pc = handler_addr;
@@ -692,13 +796,14 @@ void hardware_poll_keyboard() {
 
 void start() {
     vm.pc = 0;
-    vm.sp = 0;
-    vm.rsp = 0;
+    vm.sp = MAX_MEM;
+    vm.fp = vm.sp;
+    vm.base = 0;
+    vm.limit = MAX_MEM;
     vm.running = true;
     vm.halted = false;
     vm.int_enable = true;
     vm.int_pending = false;
-    vm.base_offset = 0;
 }
 
 void add_keyboard_interrupts() {
@@ -756,7 +861,7 @@ void bios_boot() {
 }
 
 int main() {
-    printf("\nMoYuVM Starting...\n");
+    printf("MoYuVM Starting...\n");
     start();
     bios_boot();
     while (vm.running) {
