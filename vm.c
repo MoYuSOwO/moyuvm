@@ -45,6 +45,7 @@ typedef struct {
     uint32_t base;
     uint32_t limit;
     uint32_t rv;
+    uint32_t ksp;
     uint8_t memory[MAX_MEM]; 
     bool running;
     bool halted;
@@ -141,7 +142,8 @@ typedef enum {
     REG_FP,
     REG_BASE,
     REG_LIMIT,
-    REG_RV
+    REG_RV,
+    REG_KSP
 } RegOp;
 
 uint32_t resolve_addr(uint32_t logic_addr) {
@@ -651,6 +653,7 @@ void step() {
             vm.fp = pop();
             vm.base = pop();
             vm.limit = pop();
+            vm.sp = pop();
             vm.int_enable = true;
             break;
         }
@@ -669,12 +672,28 @@ void step() {
 
         case INT: {
             uint32_t int_id = fetch_u32();
-            push(vm.limit);
-            push(vm.base);
-            push(vm.fp);
-            push(vm.rv);
-            push(vm.pc);
+
+            uint32_t old_sp = vm.sp;
+            uint32_t old_limit = vm.limit;
+            uint32_t old_base = vm.base;
+            uint32_t old_fp = vm.fp;
+            uint32_t old_rv = vm.rv;
+            uint32_t old_pc = vm.pc;
+
             vm.base = 0;
+            vm.limit = MAX_MEM;
+
+            if (old_base != 0) {
+                vm.sp = vm.ksp;
+            }
+
+            push(old_sp);
+            push(old_limit);
+            push(old_base);
+            push(old_fp);
+            push(old_rv);
+            push(old_pc);
+
             uint32_t vector_addr = int_id * 4;
             uint32_t handler_addr = load_u32(vector_addr); 
             vm.pc = handler_addr;
@@ -690,6 +709,7 @@ void step() {
                 case REG_BASE: val = vm.base; break; 
                 case REG_LIMIT: val = vm.limit; break;
                 case REG_RV: val = vm.rv; break;
+                case REG_KSP: val = vm.ksp; break;
             }
             push(val);
             break;
@@ -728,6 +748,11 @@ void step() {
 
                 case REG_RV:
                     vm.rv = val;
+                    break;
+
+                case REG_KSP:
+                    check_privilege();
+                    vm.ksp = val;
                     break;
             }
             break;
@@ -771,12 +796,28 @@ void check_interrupts() {
         vm.halted = false;
         vm.int_enable = false;
         vm.int_pending = false;
-        push(vm.limit);
-        push(vm.base);
-        push(vm.fp);
-        push(vm.rv);
-        push(vm.pc);
+
+        uint32_t old_sp = vm.sp;
+        uint32_t old_limit = vm.limit;
+        uint32_t old_base = vm.base;
+        uint32_t old_fp = vm.fp;
+        uint32_t old_rv = vm.rv;
+        uint32_t old_pc = vm.pc;
+
         vm.base = 0;
+        vm.limit = MAX_MEM;
+
+        if (old_base != 0) {
+            vm.sp = vm.ksp;
+        }
+
+        push(old_sp);
+        push(old_limit);
+        push(old_base);
+        push(old_fp);
+        push(old_rv);
+        push(old_pc);
+
         uint32_t vector_addr = vm.int_vector * 4;
         uint32_t handler_addr = load_u32(vector_addr); 
         vm.pc = handler_addr;
