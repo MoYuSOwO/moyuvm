@@ -774,6 +774,7 @@ void check_interrupts() {
         push(vm.limit);
         push(vm.base);
         push(vm.fp);
+        push(vm.rv);
         push(vm.pc);
         vm.base = 0;
         uint32_t vector_addr = vm.int_vector * 4;
